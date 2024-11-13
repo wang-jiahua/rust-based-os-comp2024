@@ -381,3 +381,182 @@ pub fn run_next_app() -> ! {
 
 ## 多道程序与分时多任务
 
+### 多道程序放置与加载
+
+要一次加载运行多个程序，就要求**每个用户程序被内核加载到内存中的起始地址都不同**。对于每一个应用程序，使用 `cargo rustc` 单独编译， 用 `-Clink-args=-Ttext=xxxx` 选项指定链接时 `.text` 段的地址为 `0x80400000 + app_id * 0x20000` 。
+
+```rust
+pub fn load_apps() {
+    extern "C" {
+        fn _num_app();
+    }
+    let num_app_ptr = _num_app as usize as *const usize;
+    let num_app = get_num_app();
+    let app_start = unsafe { core::slice::from_raw_parts(num_app_ptr.add(1), num_app + 1) };
+    unsafe {
+        asm!("fence.i"); // 清除指令缓存
+    }
+    for i in 0..num_app { // 加载应用
+        let base_i = get_base_i(i); // 0x80400000 + i * 0x20000
+        (base_i..base_i + APP_SIZE_LIMIT).for_each(|addr| unsafe { (addr as *mut u8).write_volatile(0) }); // 清除内存
+        let src = unsafe {
+            core::slice::from_raw_parts(app_start[i] as *const u8, app_start[i + 1] - app_start[i])
+        };
+        let dst = unsafe { core::slice::from_raw_parts_mut(base_i as *mut u8, src.len()) };
+        dst.copy_from_slice(src); // 把应用从数据段加载到内存
+    }
+}
+```
+
+### 任务切换
+
+- 与 Trap 切换不同，任务切换**不涉及特权级切**换，部分由编译器完成；
+- 与 Trap 切换相同，任务切换**对应用是透明的**。
+
+任务切换是**来自两个不同应用在内核中的 Trap 控制流**之间的切换。 当一个应用 Trap 到 S 态 OS 内核中进行进一步处理时， 其 Trap 控制流可以调用一个特殊的 `__switch` 函数。 在 `__switch` 返回之后，Trap 控制流将继续从调用该函数的位置继续向下执行。 而在调用 `__switch` 之后到返回前的这段时间里， 原 Trap 控制流 `A` 会先被暂停并被切换出去， CPU 转而运行另一个应用的 Trap 控制流 `B` 。 `__switch` 返回之后，原 Trap 控制流 `A` 才会从某一条 Trap 控制流 `C` 切换回来继续执行。
+
+`__switch` 的实现：先把 `current_task_cx_ptr` 中包含的寄存器值逐个保存，再把 `next_task_cx_ptr` 中包含的寄存器值逐个恢复。
+
+```assembly
+.altmacro
+.macro SAVE_SN n
+    sd s\n, (\n+2)*8(a0)
+.endm
+.macro LOAD_SN n
+    ld s\n, (\n+2)*8(a1)
+.endm
+    .section .text
+    .globl __switch
+__switch:
+    # __switch(
+    #     current_task_cx_ptr: *mut TaskContext,
+    #     next_task_cx_ptr: *const TaskContext
+    # )
+    # 保存当前任务的内核栈
+    sd sp, 8(a0) # a0 是当前任务上下文指针
+    # 保存当前执行的 ra & s0~s11
+    sd ra, 0(a0)
+    .set n, 0
+    .rept 12
+        SAVE_SN %n
+        .set n, n + 1
+    .endr
+    # 恢复下一个执行的 ra & s0~s11
+    ld ra, 0(a1) # a1 是下一个任务上下文指针
+    .set n, 0
+    .rept 12
+        LOAD_SN %n
+        .set n, n + 1
+    .endr
+    # 恢复下一个任务的内核栈
+    ld sp, 8(a1)
+    ret
+```
+
+### 管理多道程序
+
+<img src="https://learningos.cn/rCore-Camp-Guide-2024A/_images/multiprogramming.png" alt="../_images/multiprogramming.png" style="zoom:50%;" />
+
+开始时，蓝色应用向外设提交了一个请求，外设随即开始工作， 但是它要一段时间后才能返回结果。蓝色应用于是调用 `sys_yield` **交出 CPU 使用权**， 内核让绿色应用继续执行。一段时间后 CPU 切换回蓝色应用，发现外设仍未返回结果， 于是再次 `sys_yield` 。直到第二次切换回蓝色应用，外设才处理完请求，于是蓝色应用终于可以向下执行了。
+
+初始化 `TaskManager` 的全局实例 `TASK_MANAGER`：
+
+```rust
+pub fn init_app_cx(app_id: usize) -> usize { // 向内核栈压入一个 Trap 上下文
+    KERNEL_STACK[app_id].push_context(TrapContext::app_init_context(
+        get_base_i(app_id),
+        USER_STACK[app_id].get_sp(),
+    )) // 返回压入 Trap 上下文后 sp 的值
+}
+
+pub fn goto_restore(kstack_ptr: usize) -> Self {
+    extern "C" {
+        fn __restore();
+    }
+    Self {
+        ra: __restore as usize, // 将 ra 设置为 __restore 的入口地址
+        sp: kstack_ptr,
+        s: [0; 12],
+    }
+}
+
+lazy_static! {
+    pub static ref TASK_MANAGER: TaskManager = {
+        let num_app = get_num_app(); // 链接到内核的应用总数
+        let mut tasks = [TaskControlBlock {
+            task_cx: TaskContext::zero_init(),
+            task_status: TaskStatus::UnInit,
+        }; MAX_APP_NUM];
+        for (i, task) in tasks.iter_mut().enumerate() {
+            task.task_cx = TaskContext::goto_restore(init_app_cx(i));
+            task.task_status = TaskStatus::Ready; // 运行状态设置为 Ready
+        }
+        TaskManager {
+            num_app,
+            inner: unsafe {
+                UPSafeCell::new(TaskManagerInner {
+                    tasks,
+                    current_task: 0,
+                })
+            },
+        }
+    };
+}
+```
+
+`task::run_first_task` 执行第一个应用
+
+```rust
+fn run_first_task(&self) -> ! {
+    let mut inner = self.inner.exclusive_access();
+    let task0 = &mut inner.tasks[0];
+    task0.task_status = TaskStatus::Running;
+    let next_task_cx_ptr = &task0.task_cx as *const TaskContext;
+    drop(inner);
+    let mut _unused = TaskContext::zero_init(); // 空的任务上下文, 声明 _unused 是为了避免其他数据被覆盖
+    // before this, we should drop local variables that must be dropped manually
+    unsafe { // 将 _unused 的地址作为第1个参数传给 __switch
+        __switch(&mut _unused as *mut TaskContext, next_task_cx_ptr);
+    }
+    panic!("unreachable in run_first_task!");
+}
+```
+
+### 分时多任务系统
+
+RISC-V 要求处理器维护时钟计数器 `mtime`，还有另外一个 CSR `mtimecmp` 。 **一旦计数器 `mtime` 的值超过了 `mtimecmp`，就会触发一次时钟中断**。
+
+```rust
+const CLOCK_FREQ: usize = 12500000; // 时钟频率（Hz）
+const TICKS_PER_SEC: usize = 100; // 每秒 tick 次数
+
+pub fn set_next_trigger() {
+    set_timer(get_time() + CLOCK_FREQ / TICKS_PER_SEC); // 在 10 ms 后设置时钟中断
+}
+```
+
+默认情况下，当 Trap 进入某个特权级之后，在 Trap 处理的过程中**同特权级的中断都会被屏蔽**。
+
+- 当 Trap 发生时，`sstatus.sie` 会被保存在 `sstatus.spie` 字段中，同时 `sstatus.sie` 置零， 在 Trap 处理的过程中屏蔽了所有 S 特权级的中断；
+- 当 Trap 处理完毕 `sret` 的时候， `sstatus.sie` 会恢复到 `sstatus.spie` 内的值。
+
+所以，如果不去手动设置 `sstatus` CSR ，在只考虑 S 特权级中断的情况下，是**不会出现嵌套中断**的。
+
+> **嵌套中断**可以分为两部分：在处理一个中断的过程中又被**同**特权级/**高**特权级中断所打断。默认情况下硬件会避免前一部分，也可以通过手动设置来允许前一部分的存在；而后一部分则是无论如何设置都不可避免的。
+>
+> **嵌套 Trap** 是指处理一个 Trap 过程中又再次发生 Trap ，嵌套中断算是**嵌套 Trap** 的一种。
+
+为了避免 S 特权级时钟中断被屏蔽，需要在执行第一个应用前调用 `enable_timer_interrupt()` 设置 `sie.stie`， 使得 S 特权级时钟中断不会被屏蔽；再设置第一个 10ms 的计时器。
+
+### lab1
+
+`TaskControlBlock` 新增字段 `syscall_times`，保存每个系统调用的次数。
+
+ `TaskManager` 新增方法 `increase_syscall_time()` 和 `get_syscall_times()`，分别增加系统调用次数和获取系统调用次数。同时包装为同名函数，内部调用 `TASK_MANAGER` 的方法。
+
+执行 `syscall()` 时首先调用 `increase_syscall_time()` 增加系统调用次数。
+
+`sys_task_info()` 设置 `TaskInfo` 的 `status` 为 `TaskStatus::Running`，`syscall_times` 从 `get_syscall_times()` 中获取，`time` 从 `get_time_ms()` 中获取。
+
+## 地址空间
+
