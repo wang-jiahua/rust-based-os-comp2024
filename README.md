@@ -1044,3 +1044,605 @@ pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&
 ```
 
 ### lab 2
+
+## 进程及进程管理
+
+### 与进程有关的重要系统调用
+
+用户初始进程
+
+```rust
+fn main() -> i32 {
+    if fork() == 0 {
+        exec("ch5b_user_shell\0", &[0 as *const u8]); // 子进程, 需要在字符串末尾手动加入 \0
+    } else {
+        loop { // 父进程
+            let mut exit_code: i32 = 0;
+            let pid = wait(&mut exit_code); // 等待并回收系统中的僵尸进程占据的资源
+            if pid == -1 {
+                yield_(); // 回收失败, 交出 CPU 资源
+                continue;
+            }
+            println!(
+                "[initproc] Released a zombie process, pid={}, exit_code={}",
+                pid, exit_code,
+            );
+        }
+    }
+    0
+}
+```
+
+shell
+
+```rust
+pub fn main() -> i32 {
+    println!("Rust user shell");
+    let mut line: String = String::new(); // 用户当前输入的命令内容
+    print!(">> ");
+    flush();
+    loop {
+        let c = getchar(); // 获取一个用户输入的字符
+        match c {
+            LF | CR => { // 回车
+                print!("\n");
+                if !line.is_empty() {
+                    line.push('\0');
+                    let pid = fork();
+                    if pid == 0 { // 子进程
+                        if exec(line.as_str(), &[0 as *const u8]) == -1 {
+                            println!("Error when executing!");
+                            return -4;
+                        }
+                        unreachable!();
+                    } else { // 父进程
+                        let mut exit_code: i32 = 0;
+                        let exit_pid = waitpid(pid as usize, &mut exit_code);
+                        assert_eq!(pid, exit_pid);
+                        println!("Shell: Process {} exited with code {}", pid, exit_code);
+                    }
+                    line.clear();
+                }
+                print!(">> ");
+                flush();
+            }
+            BS | DL => { // 退格
+                if !line.is_empty() {
+                    print!("{}", BS as char);
+                    print!(" ");
+                    print!("{}", BS as char);
+                    flush();
+                    line.pop();
+                }
+            }
+            _ => {
+                print!("{}", c as char);
+                flush();
+                line.push(c as char);
+            }
+        }
+    }
+}
+```
+
+### 进程管理的核心数据结构
+
+`exec` 系统调用根据**应用的名字**来获取应用的 ELF 格式数据。 在链接器 `os/build.rs` 中，我们按顺序保存链接进来的每个应用的名字：
+
+```rust
+writeln!(
+    f,
+    r#"
+    .global _app_names
+    _app_names:"#
+)?;
+for app in apps.iter() { // 各个应用的名字通过 .string 伪指令放到数据段中
+    writeln!(f, r#"    .string "{}""#, app)?;
+}
+```
+
+在加载器 `loader.rs` 中，用一个全局可见的只读向量 `APP_NAMES` 来按照顺序将所有应用的名字保存在内存中：
+
+```rust
+lazy_static! {
+    static ref APP_NAMES: Vec<&'static str> = {
+        let num_app = get_num_app();
+        extern "C" {
+            fn _app_names();
+        }
+        let mut start = _app_names as usize as *const u8;
+        let mut v = Vec::new();
+        unsafe {
+            for _ in 0..num_app {
+                let mut end = start;
+                while end.read_volatile() != b'\0' {
+                    end = end.add(1);
+                }
+                let slice = core::slice::from_raw_parts(start, end as usize - start as usize);
+                let str = core::str::from_utf8(slice).unwrap();
+                v.push(str);
+                start = end.add(1);
+            }
+        }
+        v
+    };
+}
+```
+
+任务控制块中包含两部分：
+
+- 在初始化之后就不再变化的作为一个字段直接放在任务控制块中。这里将进程标识符 `PidHandle` 和内核栈 `KernelStack` 放在其中；
+- 在运行过程中可能发生变化的则放在 `TaskControlBlockInner` 中，将它再包裹上一层 `UPSafeCell<T>` 放在任务控制块中。 在此使用 `UPSafeCell<T>` 可以**提供互斥**从而避免数据竞争。
+
+```rust
+pub struct TaskControlBlock {
+    // 不可变
+    pub pid: PidHandle,
+    pub kernel_stack: KernelStack,
+    /// 可变
+    inner: UPSafeCell<TaskControlBlockInner>,
+}
+
+pub struct TaskControlBlockInner {
+    pub trap_cx_ppn: PhysPageNum, // 应用地址空间中的 Trap 上下文被放在的物理页帧的物理页号
+    pub base_size: usize, // 应用数据仅有可能出现在应用地址空间低于 base_size 字节的区域中
+    pub task_cx: TaskContext, // 任务上下文，用于任务切换
+    pub task_status: TaskStatus, // 当前进程的执行状态
+    pub memory_set: MemorySet, // 应用地址空间
+    pub parent: Option<Weak<TaskControlBlock>>, // 当前进程的父进程
+    pub children: Vec<Arc<TaskControlBlock>>, // 当前进程的所有子进程
+    pub exit_code: i32, // 当进程调用 exit 系统调用主动退出或者执行出错由内核终止的时候, 退出码会被内核保存在它的任务控制块中
+    pub heap_bottom: usize, // 堆底
+    pub program_brk: usize,
+}
+```
+
+每个 `Processor` 都有一个 idle 控制流，它们运行在每个核各自的启动栈上，功能是**尝试从任务管理器中选出一个任务来在当前核上执行**。在内核初始化完毕之后，核通过调用 `run_tasks` 函数来进入 idle 控制流：
+
+```rust
+pub fn run_tasks() {
+    loop {
+        let mut processor = PROCESSOR.exclusive_access();
+        if let Some(task) = fetch_task() { // 从任务管理器中取出一个任务
+            let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();
+            let mut task_inner = task.inner_exclusive_access();
+            let next_task_cx_ptr = &task_inner.task_cx as *const TaskContext; // 下个任务上下文
+            task_inner.task_status = TaskStatus::Running;
+            drop(task_inner); // 手动释放
+            processor.current = Some(task); // 手动释放
+            drop(processor); // 手动释放
+            unsafe {
+                __switch(idle_task_cx_ptr, next_task_cx_ptr); // 任务切换
+            }
+        } else {
+            warn!("no tasks available in run_tasks");
+        }
+    }
+}
+```
+
+当一个应用交出 CPU 使用权时，进入内核后它会调用 `schedule` 函数来切换到 idle 控制流并开启新一轮的任务调度。
+
+```rust
+pub fn schedule(switched_task_cx_ptr: *mut TaskContext) {
+    let mut processor = PROCESSOR.exclusive_access();
+    let idle_task_cx_ptr = processor.get_idle_task_cx_ptr();
+    drop(processor);
+    unsafe {
+        __switch(switched_task_cx_ptr, idle_task_cx_ptr);
+    }
+}
+```
+
+### 进程管理机制的设计实现
+
+`TaskControlBlock::new` 创建一个进程控制块，它需要传入 ELF 可执行文件的数据切片作为参数，这可以通过加载器 `loader` 子模块提供的 `get_app_data_by_name` 接口查找 `initproc` 的 ELF 数据来获得。初始化 `INITPROC` 之后，在 `add_initproc` 中可以调用 `task` 的任务管理器 `manager` 子模块提供的 `add_task` 接口将其加入到任务管理器。
+
+```rust
+pub fn new(elf_data: &[u8]) -> Self {
+    // 解析 ELF 得到应用地址空间、用户栈在应用地址空间中的位置、应用的入口点
+    let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf_data);
+    // 手动查页表找到应用地址空间中的 Trap 上下文实际所在的物理页帧
+    let trap_cx_ppn = memory_set.translate(VirtAddr::from(TRAP_CONTEXT_BASE).into()).unwrap().ppn();
+    let pid_handle = pid_alloc(); // 为新进程分配 PID
+    let kernel_stack = kstack_alloc(); // 为新进程分配内核栈
+    let kernel_stack_top = kernel_stack.get_top(); // 内核栈在内核地址空间的位置
+    // push a task context which goes to trap_return to the top of kernel stack
+    let task_control_block = Self {
+        pid: pid_handle,
+        kernel_stack,
+        inner: unsafe {
+            UPSafeCell::new(TaskControlBlockInner {
+                trap_cx_ppn,
+                base_size: user_sp,
+                // 在该进程的内核栈上压入初始化的任务上下文，使得第一次任务切换到它的时候可以跳转到 trap_return 并进入用户态开始执行
+                task_cx: TaskContext::goto_trap_return(kernel_stack_top),
+                task_status: TaskStatus::Ready,
+                memory_set,
+                parent: None,
+                children: Vec::new(),
+                exit_code: 0,
+                heap_bottom: user_sp,
+                program_brk: user_sp,
+            })
+        },
+    };
+    // prepare TrapContext in user space
+    let trap_cx = task_control_block.inner_exclusive_access().get_trap_cx();
+    // 初始化位于该进程应用地址空间中的 Trap 上下文，使得第一次进入用户态时，能正确跳转到应用入口点并设置好用户栈，同时也保证在 Trap 的时候用户态能正确进入内核态
+    *trap_cx = TrapContext::app_init_context(
+        entry_point,
+        user_sp,
+        KERNEL_SPACE.exclusive_access().token(),
+        kernel_stack_top,
+        trap_handler as usize,
+    );
+    task_control_block
+}
+```
+
+调用 `task` 子模块提供的 `suspend_current_and_run_next` 函数可以暂停当前任务，并切换到下一个任务
+
+```rust
+pub fn suspend_current_and_run_next() {
+    let task = take_current_task().unwrap(); // 当前正在执行的任务
+    let mut task_inner = task.inner_exclusive_access();
+    let task_cx_ptr = &mut task_inner.task_cx as *mut TaskContext;
+    task_inner.task_status = TaskStatus::Ready; // 修改其进程控制块内的状态
+    drop(task_inner);
+    add_task(task); // 将这个任务放入任务管理器的队尾
+    schedule(task_cx_ptr); // 触发调度并切换任务
+}
+```
+
+fork 系统调用的实现
+
+```rust
+pub fn from_another(another: &Self) -> Self {
+    Self {
+        vpn_range: VPNRange::new(another.vpn_range.get_start(), another.vpn_range.get_end()),
+        data_frames: BTreeMap::new(),
+        map_type: another.map_type,
+        map_perm: another.map_perm,
+    }
+}
+
+pub fn from_existed_user(user_space: &Self) -> Self {
+    let mut memory_set = Self::new_bare();
+    // map trampoline
+    memory_set.map_trampoline();
+    // copy data sections/trap_context/user_stack
+    for area in user_space.areas.iter() {
+        let new_area = MapArea::from_another(area);
+        memory_set.push(new_area, None);
+        // copy data from another space
+        for vpn in area.vpn_range {
+            let src_ppn = user_space.translate(vpn).unwrap().ppn();
+            let dst_ppn = memory_set.translate(vpn).unwrap().ppn();
+            dst_ppn
+            .get_bytes_array()
+            .copy_from_slice(src_ppn.get_bytes_array());
+        }
+    }
+    memory_set
+}
+```
+
+## 文件系统与 I/O 重定向
+
+### 文件与文件描述符
+
+在进程看来，所有文件的访问都可以通过一个简洁统一的抽象接口 `File` 进行
+
+```rust
+pub trait File: Send + Sync {
+    fn readable(&self) -> bool;
+    fn writable(&self) -> bool;
+    fn read(&self, buf: UserBuffer) -> usize;
+    fn write(&self, buf: UserBuffer) -> usize;
+}
+```
+
+`UserBuffer` 是在 `mm` 子模块中定义的应用地址空间中的一段缓冲区，我们可以将它看成一个 `&[u8]` 切片。
+
+```rust
+pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>
+```
+
+- `Vec` 的动态长度特性使得我们**无需设置一个固定的文件描述符数量上限**；
+- `Option` 使得我们可以**区分一个文件描述符当前是否空闲**，当它是 `None` 的时候是空闲的，而 `Some` 则代表它已被占用；
+- `Arc` 提供了**共享引用**能力。可能会有多个进程共享同一个文件对它进行读写。被它包裹的内容会被放到内核堆而不是栈上，它**不需要在编译期有着确定的大小**；
+- `dyn` 关键字表明 `Arc` 里面的类型实现了 `File/Send/Sync` 三个 Trait ，但是**编译期无法知道它具体是哪个类型**（可能是任何实现了 `File` Trait 的类型如 `Stdin/Stdout` ，故而**它所占的空间大小自然也无法确定**），需要等到运行时才能知道它的具体类型。
+
+### 文件系统接口
+
+我们实现的文件系统进行了很大的简化：
+
+- 扁平化：**仅存在根目录 `/` 一个目录**，所有的文件都放在根目录内。直接以文件名索引文件。
+- 不设置用户和用户组概念，不记录文件访问/修改的任何时间戳，不支持软硬链接。
+- 只实现了最基本的文件系统相关系统调用。
+
+```rust
+fn sys_openat(dirfd: usize, path: &str, flags: u32, mode: u32) -> isize
+```
+
+- 如果 `flags` 为 0，则表示以**只读**模式 *RDONLY* 打开；
+- 如果 `flags` 第 0 位被设置（`0x001`），表示以**只写**模式 *WRONLY* 打开；
+- 如果 `flags` 第 1 位被设置（`0x002`），表示既**可读又可写** *RDWR* ；
+- 如果 `flags` 第 9 位被设置（`0x200`），表示允许**创建**文件 *CREATE* ，在找不到该文件的时候应创建文件；如果该文件已经存在则应该将该文件的大小归零；
+- 如果 `flags` 第 10 位被设置（`0x400`），则在打开文件的时候应该**清空**文件的内容并将该文件的大小归零，也即 *TRUNC* 。
+
+本教程只实现文件的**顺序读写**，而不考虑随机读写。
+
+### 简易文件系统 easy-fs
+
+出于解耦合考虑，文件系统 easy-fs 被从内核中分离出来，分成两个不同的 crate ：
+
+- `easy-fs` 是简易文件系统的本体；
+- `easy-fs-fuse` 是能在开发环境中运行的应用程序，用于**将应用打包为 easy-fs 格式的文件系统镜像**，也可以用来**对 `easy-fs` 进行测试**。
+
+easy-fs与底层设备驱动之间通过抽象接口 `BlockDevice` 来连接，采用**轮询**方式访问 `virtio_blk` 虚拟磁盘设备，**避免调用外设中断的相关内核函数**。easy-fs **避免了直接访问进程相关的数据和函数**，从而能独立于内核开发。
+
+`easy-fs` crate 以层次化思路设计，自下而上可以分成五个层次：
+
+1. **磁盘块设备接口**层：以**块**为单位对磁盘块设备进行读写的 trait 接口
+2. **块缓存**层：**在内存中缓存磁盘块的数据**，避免频繁读写磁盘
+3. **磁盘数据结构**层：磁盘上的**超级块、位图、索引节点、数据块、目录项**等核心数据结构和相关处理
+4. **磁盘块管理器**层：合并了上述核心数据结构和磁盘布局所形成的磁盘文件系统数据结构
+5. **索引节点**层：管理索引节点，实现了文件创建/文件打开/文件读写等成员函数
+
+<img src="https://learningos.cn/rCore-Camp-Guide-2024A/_images/easy-fs-demo.png" alt="../_images/easy-fs-demo.png" style="zoom:48%;" />
+
+```rust
+pub const BLOCK_SZ: usize = 512;
+
+pub struct BlockCache {
+    cache: [u8; BLOCK_SZ], // 位于内存中的缓冲区
+    block_id: usize, // 块的编号
+    block_device: Arc<dyn BlockDevice>, // 块所属的底层设备
+    modified: bool, // 自从这个块缓存从磁盘载入内存之后，它有没有被修改过
+}
+```
+
+内存只能同时缓存有限个磁盘块。当要对一个磁盘块进行读写时，块缓存全局管理器检查它是否已经被载入内存中，如果是则直接返回，否则就读取磁盘块到内存。如果内存中驻留的磁盘块缓冲区的数量已满，则需要进行缓存替换。这里使用一种类 **FIFO** 的缓存替换算法，在管理器中只需维护一个队列。
+
+```rust
+pub struct BlockCacheManager {
+    queue: VecDeque<(usize, Arc<Mutex<BlockCache>>)>,
+}
+```
+
+队列 `queue` 维护块编号和块缓存的二元组。块缓存的类型是一个 `Arc<Mutex<BlockCache>>` ，它可以同时提供**共享引用**和**互斥访问**。共享引用意义在于块缓存既需要**在管理器 `BlockCacheManager` 保留一个引用**，还需要**将引用返回给块缓存的请求者**。而互斥访问在**单核**上的意义在于**提供内部可变性通过编译**，在**多核**环境下则可以帮助我们**避免可能的并发冲突**。
+
+easy-fs 磁盘按照块编号从小到大顺序分成 5 个连续区域：
+
+- 第一个区域只包括一个块，它是**超级块** (Super Block)，用于**定位其他连续区域的位置**，**检查文件系统合法性**。
+- 第二个区域是一个**索引节点位图**，长度为若干个块。它记录了**索引节点区域中有哪些索引节点已经被分配出去使用了**。
+- 第三个区域是**索引节点区域**，长度为若干个块。其中的每个块都存储了若干个索引节点。
+- 第四个区域是一个**数据块位图**，长度为若干个块。它记录了后面的**数据块区域中有哪些已经被分配出去使用了**。
+- 最后的区域则是数据块区域，其中的每个被分配出去的块保存了文件或目录的具体内容。
+
+每个位图都由若干个块组成，**每个块大小 4096 bits**。每个 bit 都代表一个索引节点/数据块的分配状态。`Bitmap` 是位图区域的管理器，它保存了位图区域的起始块编号和块数。而 `BitmapBlock` 将位图区域中的一个**磁盘块**解释为**长度为 64 的一个 `u64` 数组**。
+
+`Bitmap` 分配一个bit：
+
+```rust
+const BLOCK_BITS: usize = BLOCK_SZ * 8;
+
+pub fn alloc(&self, block_device: &Arc<dyn BlockDevice>) -> Option<usize> {
+    for block_id in 0..self.blocks { // 枚举区域中的每个块
+        let pos = get_block_cache( // 获取块缓存
+            block_id + self.start_block_id as usize, // 区域起始块编号 + 区域内的块编号 == 块设备上的块编号
+            Arc::clone(block_device),
+        )
+        .lock() // 获取块缓存的互斥锁, 从而可以对块缓存进行访问
+        .modify(0, |bitmap_block: &mut BitmapBlock| { // 从缓冲区偏移量为 0 的位置开始将一段连续的数据（数据的长度随具体类型而定）解析为一个 BitmapBlock 并要对该数据结构进行修改
+            if let Some((bits64_pos, inner_pos)) = bitmap_block
+                .iter()
+                .enumerate()
+                .find(|(_, bits64)| **bits64 != u64::MAX)
+                .map(|(bits64_pos, bits64)| (bits64_pos, bits64.trailing_ones() as usize))
+            { // 找到最低的一个 0 并置为 1
+                bitmap_block[bits64_pos] |= 1u64 << inner_pos;
+                Some(block_id * BLOCK_BITS + bits64_pos * 64 + inner_pos as usize)
+            } else {
+                None
+            }
+        });
+        if pos.is_some() {
+            return pos;
+        }
+    }
+    None
+}
+```
+
+每个文件/目录在磁盘上均以一个 `DiskInode` 的形式存储。其中包含文件/目录的元数据：`size` 表示文件/目录内容的字节数， `type_` 表示索引节点的类型 `DiskInodeType`，目前仅支持文件 `File` 和目录 `Directory` 两种类型。`direct/indirect1/indirect2` 是存储文件内容/目录内容的数据块的索引。
+
+为了尽可能节约空间，在进行索引的时候，块的编号用一个 `u32` 存储。索引方式分成**直接索引**和**间接索引**两种：
+
+- 当文件很小的时候，只需用到直接索引，`direct` 数组中最多可以指向 `INODE_DIRECT_COUNT` 个数据块，当取值为 28 的时候，通过直接索引可以找到 14 KiB 的内容（每个数据块 4096 bit = 512 B）。
+- 当文件比较大的时候，不仅直接索引的 `direct` 数组装满，还需要用到一级间接索引 `indirect1` 。它指向一个一级索引块，这个块也位于磁盘布局的数据块区域中。这个一级索引块中的每个 `u32` 都用来指向数据块区域中一个保存该文件内容的数据块，最多能够索引 512 / 4 = 128 个数据块，对应 64 KiB 的内容。
+- 当文件大小超过直接索引和一级索引支持的容量上限 78 KiB 的时候，就需要用到二级间接索引 `indirect2` 。它指向一个位于数据块区域中的二级索引块。二级索引块中的每个 `u32` 指向一个不同的一级索引块，这些一级索引块也位于数据块区域中。通过二级间接索引最多能够索引 128 × 64 KiB = 8 MiB 的内容。
+
+为了充分利用空间，`DiskInode` 的大小设置为 128 B，每个块正好能够容纳 4 个 `DiskInode` 。在后续需要支持更多类型的元数据的时候，可以适当缩减直接索引 `direct` 的块数，并将节约出来的空间用来存放其他元数据，仍可保证 `DiskInode` 的总大小为 128 B。
+
+对于文件而言，它的内容在文件系统或内核看来没有任何既定的格式，只是一个字节序列。**目录**的内容却需要遵从一种特殊的格式，它可以看成一个**目录项**的序列，每个目录项都是一个二元组，包括目录下文件的**文件名**和**索引节点编号**。
+
+在块设备上创建并初始化一个 easy-fs 文件系统：
+
+```rust
+pub fn create(block_device: Arc<dyn BlockDevice>, total_blocks: u32, inode_bitmap_blocks: u32) -> Arc<Mutex<Self>> {
+    // 计算每个区域各应该包含多少块
+    let inode_bitmap = Bitmap::new(1, inode_bitmap_blocks as usize); // 索引位图
+    let inode_num = inode_bitmap.maximum(); // 索引数
+    let inode_area_blocks = ((inode_num * core::mem::size_of::<DiskInode>() + BLOCK_SZ - 1) / BLOCK_SZ) as u32;
+    let inode_total_blocks = inode_bitmap_blocks + inode_area_blocks; // 索引总块数
+    let data_total_blocks = total_blocks - 1 - inode_total_blocks; // 数据总块数
+    let data_bitmap_blocks = (data_total_blocks + 4096) / 4097; // 数据位图块数
+    let data_area_blocks = data_total_blocks - data_bitmap_blocks; // 数据区域块数
+    let data_bitmap = Bitmap::new(
+        (1 + inode_bitmap_blocks + inode_area_blocks) as usize,
+        data_bitmap_blocks as usize,
+    );
+    let mut efs = Self { // 创建实例
+        block_device: Arc::clone(&block_device),
+        inode_bitmap,
+        data_bitmap,
+        inode_area_start_block: 1 + inode_bitmap_blocks,
+        data_area_start_block: 1 + inode_total_blocks + data_bitmap_blocks,
+    };
+    for i in 0..total_blocks { // 将块设备的前 total_blocks 个块清零
+        get_block_cache(i as usize, Arc::clone(&block_device))
+            .lock()
+            .modify(0, |data_block: &mut DataBlock| {
+                for byte in data_block.iter_mut() {
+                    *byte = 0;
+                }
+            });
+    }
+    // 将位于块设备编号为 0 块上的超级块进行初始化
+    get_block_cache(0, Arc::clone(&block_device)).lock().modify(
+        0,
+        |super_block: &mut SuperBlock| {
+            super_block.initialize(
+                total_blocks,
+                inode_bitmap_blocks,
+                inode_area_blocks,
+                data_bitmap_blocks,
+                data_area_blocks,
+            );
+        },
+    );
+    // 立即写回
+    // 创建根目录 /
+    assert_eq!(efs.alloc_inode(), 0); // 在 inode 位图中分配一个 inode
+    let (root_inode_block_id, root_inode_offset) = efs.get_disk_inode_pos(0);
+    get_block_cache(root_inode_block_id as usize, Arc::clone(&block_device))
+        .lock()
+        .modify(root_inode_offset, |disk_inode: &mut DiskInode| {
+            disk_inode.initialize(DiskInodeType::Directory);
+        });
+    block_cache_sync_all();
+    Arc::new(Mutex::new(efs))
+}
+```
+
+`EasyFileSystem` 实现了磁盘布局并能够将所有块有效的管理起来。但是文件系统的使用者不关心磁盘布局是如何实现的，而是更希望能够直接看到目录树结构中逻辑上的文件和目录。设计索引节点 `Inode` 暴露给文件系统的使用者，让他们能够直接对文件和目录进行操作。`DiskInode` 放在**磁盘块中比较固定的位**置，而 `Inode` 是**放在内存中的记录文件索引节点信息**的数据结构。
+
+**所有暴露给文件系统的使用者的文件系统操作，全程均需持有 `EasyFileSystem` 的互斥锁**（文件系统内部的操作都是假定在已持有 efs 锁的情况下才被调用的，因此它们不应尝试获取锁）。这能够保证**在多核情况下，同时最多只能有一个核在进行文件系统相关操作**。如果我们在这里加锁的话，其实就能够保证块缓存的互斥访问了。
+
+之前需要将所有的应用都链接到内核中，随后在应用管理器中通过应用名进行索引来找到应用的 ELF 数据。这样做会**造成内核体积过度膨胀**，同时也会**浪费内存资源**，因为未被执行的应用也占据了内存空间。在实现了我们自己的文件系统之后，可以**将这些应用打包到 easy-fs 镜像中放到磁盘中**，当我们要执行应用的时候只需从文件系统中取出ELF 执行文件格式的应用 并加载到内存中执行即可，这样就避免了上面的那些问题。
+
+### 在内核中使用 easy-fs
+
+在 qemu 上，我们使用 `VirtIOBlock` 访问 VirtIO 块设备，并将它全局实例化为 `BLOCK_DEVICE` ，使内核的其他模块可以访问。
+
+在启动 Qemu 模拟器的时候，我们可以配置参数来添加一块 VirtIO 块设备：
+
+```shell
+FS_IMG := ../user/target/$(TARGET)/$(MODE)/fs.img
+
+run-inner:
+	@qemu-system-riscv64 \
+		-machine virt \
+		-nographic \
+		-bios $(BOOTLOADER) \
+		-device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) \
+		-drive file=$(FS_IMG),if=none,format=raw,id=x0 \ # 为虚拟机添加一块虚拟硬盘，内容为通过 easy-fs-fuse 打包的包含应用 ELF 的 easy-fs 镜像，并命名为 x0
+        -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 # 将硬盘 x0 作为一个 VirtIO 总线中的一个块设备接入到虚拟机系统中。 VirtIO 总线通过 MMIO 进行控制，且该块设备在总线中的编号为 0
+```
+
+**内存映射 I/O** (MMIO, Memory-Mapped I/O) 指**通过特定的物理内存地址来访问外设的设备寄存器**。VirtIO 总线的 MMIO 物理地址区间为从 `0x10001000` 开头的 4 KiB 。
+
+在 `config` 子模块中我们硬编码 Qemu 上的 VirtIO 总线的 MMIO 地址区间（起始地址，长度）。在创建内核地址空间的时候需要建立页表映射：
+
+## 进程间通信
+
+### 管道
+
+```rust
+pub struct Pipe {
+    readable: bool,
+    writable: bool,
+    buffer: Arc<Mutex<PipeRingBuffer>>,
+}
+
+const RING_BUFFER_SIZE: usize = 32;
+
+#[derive(Copy, Clone, PartialEq)]
+enum RingBufferStatus {
+    FULL,
+    EMPTY,
+    NORMAL,
+}
+
+pub struct PipeRingBuffer {
+    arr: [u8; RING_BUFFER_SIZE],
+    head: usize,
+    tail: usize,
+    status: RingBufferStatus,
+    write_end: Option<Weak<Pipe>>, // 写端的一个弱引用计数，在某些情况下需要确认该管道所有的写端是否都已经被关闭了
+}
+```
+
+每个读端或写端中都保存着所属管道自身的**强引用计数**，这些引用计数只会出现在管道端口 `Pipe` 结构体中。一旦一个管道所有的读端和写端均被关闭，便会导致它们所属管道的引用计数变为 0 ，循环队列缓冲区所占用的资源被自动回收。虽然 `PipeRingBuffer` 中保存了一个指向写端的引用计数，但是它是一个弱引用，也就不会出现循环引用的情况导致内存泄露。
+
+```rust
+pub fn all_write_ends_closed(&self) -> bool {
+    self.write_end.as_ref().unwrap().upgrade().is_none()
+}
+```
+
+判断管道的所有写端是否都被关闭了，这是通过**尝试将管道中保存的写端的弱引用计数升级为强引用计数**来实现的。如果升级失败的话，说明管道写端的强引用计数为 0 ，也就意味着管道所有写端都被关闭了，从而管道中的数据不会再得到补充，待管道中仅剩的数据被读取完毕之后，管道就可以被销毁了。
+
+### 命令行参数与标准 I/O 重定向
+
+在 shell 程序中，一旦接收到一个回车，就会将当前行的内容 `line` 作为一个名字并试图去执行同名的应用。但是现在 `line` 还可能包含一些命令行参数，**只有最开头的一个才是要执行的应用名**。因此要做的第一件事情就是将 `line` 用空格分割。经过分割， `args` 中的 `&str` 都是 `line` 中的一段子区间，它们的结尾并没有包含 `\0` ，因为 `line` 是输入得到的，中间本来就没有 `\0` 。由于在向内核传入字符串的时候，只能传入字符串的起始地址，因此必须保证其结尾为 `\0` 。用 `args_copy` 将 `args` 中的字符串**拷贝一份到堆上并在末尾手动加入 `\0`** 。这样就可以安心的将 `args_copy` 中的字符串传入内核了。
+
+<img src="https://learningos.cn/rCore-Camp-Guide-2024A/_images/user-stack-cmdargs.png" alt="../_images/user-stack-cmdargs.png" style="zoom:50%;" />
+
+首先在用户栈上分配一个**字符串指针数组**（蓝色区域），数组中的每个元素都指向一个用户栈更低处的命令行参数字符串的起始地址。最开始只是分配空间，具体的值要等到字符串被放到用户栈上之后才能确定更新。然后逐个将传入的 `args` 中的字符串压入到用户栈中（橙色区域），在用户栈上预留空间之后逐字节进行复制。`args` 中的字符串是通过 `translated_str` 从应用地址空间取出的，它的末尾不包含 `\0` 。为了应用能知道每个字符串的长度，需要手动在末尾加入 `\0` 。
+
+## 并发
+
+### 内核态的线程管理
+
+操作系统让进程拥有相互隔离的虚拟的地址空间， 让进程感到在独占一个虚拟的处理器。其实这只是操作系统通过时分复用和空分复用技术来让每个进程复用有限的物理内存和物理 CPU。 而线程是在进程内中的一个新的抽象。**在没有线程之前，一个进程在一个时刻只有一个执行点**（即程序计数器 (PC) 寄存器保存的要执行指令的指针）。但**线程的引入把进程内的这个单一执行点给扩展为多个执行点**，即在进程中存在多个线程， 每个线程都有一个执行点。而且这些线程共享进程的地址空间，所以可以不必采用相对比较复杂的 IPC 机制（一般需要内核的介入）， 而可以很方便地直接访问进程内的数据。
+
+在线程的具体运行过程中，需要有**程序计数器寄存器**来记录当前的执行位置，需要有一组**通用寄存器**记录当前的指令的操作数据， 需要有一个**栈**来保存线程执行过程的函数调用栈和局部变量等，这就形成了**线程上下文**的主体部分。 这样如果两个线程运行在一个处理器上，就需要采用类似两个进程运行在一个处理器上的调度/切换管理机制， 即需要在一定时刻进行线程切换，并进行线程上下文的保存与恢复。这样在一个进程中的多线程可以独立运行， 取代了进程，成为操作系统调度的基本单位。
+
+由于把进程的结构进行了细化，通过线程来表示对处理器的虚拟化，使得进程成为了管理线程的容器。 在进程中的线程没有父子关系，大家都是兄弟，但还是有个老大。这个代表老大的线程其实就是创建进程（比如通过 `fork` 系统调用创建进程）时，建立的第一个线程，它的线程标识符（TID）为 `0` 。
+
+当进程调用 `thread_create` 系统调用后，内核会在这个进程内部创建一个新的线程，这个线程能够访问到进程所拥有的代码段， 堆和其他数据段。但内核会给这个新线程分配一个它专有的用户态栈，这样每个线程才能相对独立地被调度和执行。 由于用户态进程与内核之间有各自独立的页表，所以二者需要有一个跳板页 `TRAMPOLINE` 来处理用户态切换到内核态的地址空间平滑转换的事务。当出现线程后，**在进程中的每个线程也需要有一个独立的跳板页 `TRAMPOLINE`** 来完成同样的事务。相比于创建进程的 `fork` 系统调用，**创建线程不需要要建立新的地址空间**，这是二者之间最大的不同。 另外属于同一进程中的线程之间没有父子关系，这一点也与进程不一样。
+
+当一个线程执行完代表它的功能后，会通过 `exit` 系统调用退出。内核在收到线程发出的 `exit` 系统调用后， 会回收线程占用的部分资源，即**用户态用到的资源**，比如**用户态的栈，用于系统调用和异常处理的跳板页**等。 而该线程的**内核态用到的资源**，比如**内核栈**等，需要**通过进程/主线程调用 `waittid` 来回收**了， 这样整个线程才能被彻底销毁。
+
+一般情况下进程/主线程要负责通过 `waittid` 来等待它创建出来的线程（不是主线程）结束并回收它们在内核中的资源 （如线程的内核栈、**线程控制块**等）。**如果进程/主线程先调用了 `exit` 系统调用来退出，那么整个进程 （包括所属的所有线程）都会退出，而对应父进程会通过 `waitpid` 回收子进程剩余还没被回收的资源**。
+
+### 锁机制
+
+如何能够实现轻量的可睡眠锁？**让等待锁的线程睡眠，让释放锁的线程显式地唤醒等待锁的线程**。 如果有多个等待锁的线程，可以全部释放，让大家再次竞争锁；也可以只释放最早等待的那个线程。这就需要更多的操作系统支持，特别是需要一个等待队列来保存等待锁的线程。
+
+**在线程的眼里，互斥是一种每个线程能看到的资源**，且在一个进程中，可以存在多个不同互斥资源，可以**把所有的互斥资源放在一起让进程来管理**。
+
+### 信号量机制
+
+信号量的两种操作：P 操作和 V 操作。 P 操作是检查信号量的值是否大于 0，若该值大于 0，则将其值减 1 并继续（表示可以进入临界区了）；若该值为 0，则线程将睡眠。此时 P 操作还未结束。而且由于信号量本身是一种临界资源，在 P 操作中，检查/修改信号量值以及可能发生的睡眠这一系列操作， 是一个不可分割的原子操作过程。通过原子操作才能保证，一旦 P 操作开始，则在该操作完成或阻塞睡眠之前， 其他线程均不允许访问该信号量。
+
+V 操作会对信号量的值加 1 ，然后检查是否有一个或多个线程在该信号量上睡眠等待。如有， 则选择其中的一个线程唤醒并允许该线程继续完成它的 P 操作；如没有，则直接返回。信号量的值加 1， 并可能唤醒一个线程的一系列操作同样也是不可分割的原子操作过程。不会有某个进程因执行 V 操作而阻塞。
+
+信号量的另一种用途是用于实现同步。比如，把信号量的初始值设置为 0 ， 当一个线程 A 对此信号量执行一个 P 操作，那么该线程立即会被阻塞睡眠。之后有另外一个线程 B 对此信号量执行一个 V 操作，就会将线程 A 唤醒。这样线程 B 中执行 V 操作之前的代码序列 B-stmts 和线程 A 中执行 P 操作之后的代码 A-stmts 序列之间就形成了一种确定的同步执行关系，即线程 B 的 B-stmts 会先执行，然后才是线程 A 的 A-stmts 开始执行。
+
+### 条件变量机制
+
+管程有一个很重要的特性，即**任一时刻只能有一个活跃线程调用管程中的过程**， 这一特性使**线程在调用执行管程中过程时能保证互斥**，这样线程就可以放心地访问共享变量。 管程是编程语言的组成部分，编译器知道其特殊性，因此可以采用与其他过程调用不同的方法来处理对管程的调用。
+
+管程虽然借助编译器提供了一种实现互斥的简便途径，但这还不够，还需要一种线程间的沟通机制。 首先是等待机制：由于线程在调用管程中某个过程时，发现某个条件不满足，那就在无法继续运行而被阻塞。 其次是唤醒机制：另外一个线程可以在调用管程的过程中，把某个条件设置为真，并且还需要有一种机制，及时唤醒等待条件为真的阻塞线程。为了避免管程中同时有两个活跃线程， 我们需要一定的规则来约定线程发出唤醒操作的行为。目前有三种典型的规则方案：
+
+- Hoare 语义：线程发出唤醒操作后，**马上阻塞自己，让新被唤醒的线程运行**。注：**此时唤醒线程的执行位置还在管程中**。
+- Hansen 语义：执行唤醒操作的线程必须**立即退出管程**，即唤醒操作只可能作为一个管程过程的最后一条语句。 注：**此时唤醒线程的执行位置离开了管程**。
+- Mesa 语义：唤醒线程在发出行唤醒操作后**继续运行**，并且**只有它退出管程之后，才允许等待的线程开始运行**。 注：**此时唤醒线程的执行位置还在管程中**。
+
+基于 Mesa 语义的沟通机制。具体实现就是 **条件变量** 和对应的操作：wait 和 signal。线程使用条件变量来等待一个条件变成真。 条件变量其实是一个线程等待队列，当条件不满足时，线程通过执行条件变量的 wait 操作就可以把自己加入到等待队列中，睡眠等待该条件。另外某个线程，当它改变条件为真后， 就可以通过条件变量的 signal 操作来唤醒一个或者多个等待的线程（通过在该条件上发信号），让它们继续执行。
+
