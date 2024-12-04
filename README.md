@@ -1,5 +1,7 @@
 # 2024 秋冬季开源操作系统训练营学习记录
 
+# rCore
+
 ## 应用程序与基本执行环境
 
 ### 应用程序执行环境与平台支持
@@ -548,16 +550,6 @@ pub fn set_next_trigger() {
 
 为了避免 S 特权级时钟中断被屏蔽，需要在执行第一个应用前调用 `enable_timer_interrupt()` 设置 `sie.stie`， 使得 S 特权级时钟中断不会被屏蔽；再设置第一个 10ms 的计时器。
 
-### lab1
-
-`TaskControlBlock` 新增字段 `syscall_times`，保存每个系统调用的次数。
-
- `TaskManager` 新增方法 `increase_syscall_time()` 和 `get_syscall_times()`，分别增加系统调用次数和获取系统调用次数。同时包装为同名函数，内部调用 `TASK_MANAGER` 的方法。
-
-执行 `syscall()` 时首先调用 `increase_syscall_time()` 增加系统调用次数。
-
-`sys_task_info()` 设置 `TaskInfo` 的 `status` 为 `TaskStatus::Running`，`syscall_times` 从 `get_syscall_times()` 中获取，`time` 从 `get_time_ms()` 中获取。
-
 ## 地址空间
 
 ### 实现 SV39 多级页表机制
@@ -1042,8 +1034,6 @@ pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&
     v // 以向量的形式返回一组可以在内核空间中直接访问的字节数组切片
 }
 ```
-
-### lab 2
 
 ## 进程及进程管理
 
@@ -1646,3 +1636,959 @@ V 操作会对信号量的值加 1 ，然后检查是否有一个或多个线程
 
 基于 Mesa 语义的沟通机制。具体实现就是 **条件变量** 和对应的操作：wait 和 signal。线程使用条件变量来等待一个条件变成真。 条件变量其实是一个线程等待队列，当条件不满足时，线程通过执行条件变量的 wait 操作就可以把自己加入到等待队列中，睡眠等待该条件。另外某个线程，当它改变条件为真后， 就可以通过条件变量的 signal 操作来唤醒一个或者多个等待的线程（通过在该条件上发信号），让它们继续执行。
 
+# ArceOS
+
+## Unikernel 基础与框架
+
+### Hello World
+
+**内核系统**：运行在内核态的软件，向下管理硬件，向上为应用提供运行环境。**可以**独立运行。在 Rust 中，相当于`[bin].crate`
+
+**内核组件**：用于构建内核系统的最基本元素，最小可部署单元。组件可以独立构建和分发，**不能**独立运行。在 Rust 中，相当于`[lib].crate`
+
+应用与内核：
+
+1. 处于**同一特权级** - 内核态
+2. 共享**同一地址空间** - 相互可见
+3. 编译形成**一个Image，一体运行**
+4. Unikernel既是应用又是内核，是二者**合体**
+
+优势：简单高效。
+
+劣势：安全性低。
+
+引导过程: axhal(riscv64)
+
+```rust
+#[naked]
+#[no_mangle]
+#[link_section = ".text.boot"]
+unsafe extern "C" fn _start() -> ! {
+    // PC = 0x8020_0000
+    // a0 = hartid
+    // a1 = dtb
+    core::arch::asm!("
+        mv      s0, a0                  // hartid 用于将来识别 CPU
+        mv      s1, a1                  // dtb_ptr 传入 DTB 的指针
+        la      sp, {boot_stack}
+        li      t0, {boot_stack_size}
+        add     sp, sp, t0              // 尽早建立栈，后面可以开展函数调用
+        call    {init_boot_page_table}
+        call    {init_mmu}              // 准备页表，启用MMU分页机制
+        li      s2, {phys_virt_offset}  // 由于地址空间切换了，重置栈指针
+        add     sp, sp, s2
+        mv      a0, s0
+        mv      a1, s1
+        la      a2, {entry}
+        add     a2, a2, s2
+        jalr    a2                      // call rust_entry(hartid, dtb)
+        j       .",
+        phys_virt_offset = const PHYS_VIRT_OFFSET,
+        boot_stack_size = const TASK_STACK_SIZE,
+        boot_stack = sym BOOT_STACK,
+        init_boot_page_table = sym init_boot_page_table,
+        init_mmu = sym init_mmu,
+        entry = sym super::rust_entry,
+        options(noreturn),
+    )
+}
+
+unsafe extern "C" fn rust_entry(cpu_id: usize, dtb: usize) {
+    crate::mem::clear_bss();
+    crate::cpu::init_primary(cpu_id);
+    crate::arch::set_trap_vector_base(trap_vector_base as usize);
+    self::time::init_early();
+    rust_main(cpu_id, dtb); // 进入axruntime
+}
+```
+
+引导过程: axruntime
+
+```rust
+#[cfg_attr(not(test), no_mangle)]
+pub extern "C" fn rust_main(cpu_id: usize, dtb: usize) -> ! {
+    ax_println!("{}", LOGO); // 打印LOGO和基本信息
+    ax_println!(
+        "\
+        arch = {}\n\
+        platform = {}\n\
+        target = {}\n\
+        smp = {}\n\
+        build_mode = {}\n\
+        log_level = {}\n\
+        ",
+        option_env!("AX_ARCH").unwrap_or(""),
+        option_env!("AX_PLATFORM").unwrap_or(""),
+        option_env!("AX_TARGET").unwrap_or(""),
+        option_env!("AX_SMP").unwrap_or(""),
+        option_env!("AX_MODE").unwrap_or(""),
+        option_env!("AX_LOG").unwrap_or(""),
+    );
+
+    #[cfg(feature = "rtc")]
+    ax_println!(
+        "Boot at {}\n",
+        chrono::DateTime::from_timestamp_nanos(axhal::time::wall_time_nanos() as _),
+    );
+    axlog::init();
+    axlog::set_max_level(option_env!("AX_LOG").unwrap_or("")); // 初始化日志机制
+    info!("Logging is enabled.");
+    info!("Primary CPU {} started, dtb = {:#x}.", cpu_id, dtb);
+    info!("Found physcial memory regions:");
+    for r in axhal::mem::memory_regions() { // 显示kernel各个段的范围和属性
+        info!(
+            "  [{:x?}, {:x?}) {} ({:?})",
+            r.paddr,
+            r.paddr + r.size,
+            r.name,
+            r.flags
+        );
+    }
+
+    #[cfg(any(feature = "alloc", feature = "alt_alloc"))]
+    init_allocator(); // 初始化Rust的全局内存分配器(堆)
+
+    #[cfg(feature = "paging")]
+    axmm::init_memory_management(); // 重新映射kernel的各个段, 精确控制各段安全权限
+    info!("Initialize platform devices...");
+    axhal::platform_init(); // 本平台platform初始化(platform和arch的关联)
+
+    #[cfg(feature = "multitask")]
+    axtask::init_scheduler(); // 基于task的调度器，即thread调度
+
+    #[cfg(any(feature = "fs", feature = "net", feature = "display"))]
+    {
+        #[allow(unused_variables)]
+        let all_devices = axdriver::init_drivers(); // 设备与驱动初始化
+
+        #[cfg(feature = "fs")]
+        axfs::init_filesystems(all_devices.block); // 文件系统
+
+        #[cfg(feature = "net")]
+        axnet::init_network(all_devices.net); // 网络系统
+
+        #[cfg(feature = "display")]
+        axdisplay::init_display(all_devices.display);
+    }
+
+    #[cfg(feature = "smp")]
+    self::mp::start_secondary_cpus(cpu_id); // 启动其它CPU, 传参排除primary
+
+    #[cfg(feature = "irq")]
+    {
+        info!("Initialize interrupt handlers...");
+        init_interrupt(); // 初始化中断
+    }
+
+    #[cfg(all(feature = "tls", not(feature = "multitask")))]
+    {
+        info!("Initialize thread local storage...");
+        init_tls();
+    }
+
+    info!("Primary CPU {} init OK.", cpu_id);
+    INITED_CPUS.fetch_add(1, Ordering::Relaxed); // Primary cpu信号自加1 (其它secondary cpu类似)
+
+    while !is_init_ok() {
+        core::hint::spin_loop(); // 等待所有cpu都已经启动
+    }
+
+    unsafe { main() }; // 进入apps/helloworld/main
+
+    #[cfg(feature = "multitask")]
+    axtask::exit(0); // 退出前清理
+    #[cfg(not(feature = "multitask"))]
+    {
+        debug!("main task exited: exit_code={}", 0);
+        axhal::misc::terminate();
+    }
+}
+```
+
+`axhal`用于屏蔽体系结构和平台差异，例如本示例在编译时指定`ARCH=riscv64`，则会产生对应feature，指示`axhal`条件编译对应的代码，最终通过`sbi::putchar`打印到console。
+
+```rust
+#![cfg_attr(feature = "axstd", no_std)] // 没有std标准库支持
+#![cfg_attr(feature = "axstd", no_main)] // 不提供main入口
+
+#[cfg(feature = "axstd")]
+use axstd::println;
+
+#[cfg_attr(feature = "axstd", no_mangle)]
+fn main() {
+    println!("Hello, Arceos!");
+}
+```
+
+`println!`调用链
+
+```rust
+// arceos/ulib/axstd/src/macros.rs
+#[macro_export]
+macro_rules! println {
+    () => { $crate::print!("\n") };
+    ($($arg:tt)*) => {
+        $crate::io::__print_impl(format_args!("{}\n", format_args!($($arg)*)));
+    }
+}
+
+// arceos/ulib/axstd/src/io/stdio.rs
+#[doc(hidden)]
+pub fn __print_impl(args: core::fmt::Arguments) {
+    if cfg!(feature = "smp") {
+        // synchronize using the lock in axlog, to avoid interleaving
+        // with kernel logs
+        arceos_api::stdio::ax_console_write_fmt(args).unwrap();
+    } else {
+        stdout().lock().write_fmt(args).unwrap();
+    }
+}
+
+// arceos/ulib/axstd/src/io/stdio.rs
+fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+    arceos_api::stdio::ax_console_write_bytes(buf)
+}
+
+// arceos/api/arceos_api/src/imp/mod.rs
+pub fn ax_console_write_bytes(buf: &[u8]) -> crate::AxResult<usize> {
+    axhal::console::write_bytes(buf);
+    Ok(buf.len())
+}
+
+// arceos/modules/axhal/src/lib.rs
+pub fn write_bytes(bytes: &[u8]) {
+    for c in bytes {
+        putchar(*c);
+    }
+}
+
+// arceos/modules/axhal/src/platform/riscv64_qemu_virt/console.rs
+pub fn putchar(c: u8) {
+    #[allow(deprecated)]
+    sbi_rt::legacy::console_putchar(c as usize);
+}
+```
+
+在编译并运行`helloworld`时，可以指定`LOG`环境变量，以输出不同级别的日志。
+
+```shell
+make LOG=info run
+```
+
+这是通过features传递，改变kernel行为的具体方法。可以通过三种方式指定features：这是通过features传递，改变kernel行为的具体方法。可以通过三种方式指定features：
+
+- App: `Cargo.toml`
+- 具体环境变量: `LOG`
+- 通用环境变量: `FEATURES`
+
+### Collections
+
+**对基于“堆”的动态数据结构类型的支持？**Rust Collections 标准类型需要动态内存分配支持。在内核开发层面，没有另外一个 OS 内核为其提供内存管理的支持。只能由内核自己实现`global_allocator`适配自身的内存管理子系统。
+
+内存分配 – 接口和数据结构
+
+```rust
+unsafe impl GlobalAlloc for GlobalAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if let Ok(ptr) = GlobalAllocator::alloc(self, layout) {
+            ptr.as_ptr()
+        } else {
+            alloc::alloc::handle_alloc_error(layout)
+        }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        GlobalAllocator::dealloc(self, NonNull::new(ptr).expect("dealloc null ptr"), layout)
+    }
+}
+
+#[cfg_attr(all(target_os = "none", not(test)), global_allocator)]
+static GLOBAL_ALLOCATOR: GlobalAllocator = GlobalAllocator::new();
+
+/// Returns the reference to the global allocator.
+pub fn global_allocator() -> &'static GlobalAllocator {
+    &GLOBAL_ALLOCATOR
+}
+
+pub struct GlobalAllocator {
+    balloc: SpinNoIrq<DefaultByteAllocator>,
+    palloc: SpinNoIrq<BitmapPageAllocator<PAGE_SIZE>>,
+}
+```
+
+内存分配 – 框架初始化
+
+```rust
+pub fn init(&self, start_vaddr: usize, size: usize) {
+    assert!(size > MIN_HEAP_SIZE);
+    let init_heap_size = MIN_HEAP_SIZE;
+    self.palloc.lock().init(start_vaddr, size);
+    let heap_ptr = self
+    .alloc_pages(init_heap_size / PAGE_SIZE, PAGE_SIZE)
+    .unwrap();
+    self.balloc.lock().init(heap_ptr, init_heap_size);
+}
+
+pub fn alloc(&self, layout: Layout) -> AllocResult<NonNull<u8>> {
+    // simple two-level allocator: if no heap memory, allocate from the page allocator.
+    let mut balloc = self.balloc.lock();
+    loop {
+        if let Ok(ptr) = balloc.alloc(layout) {
+            return Ok(ptr);
+        } else {
+            let old_size = balloc.total_bytes();
+            let expand_size = old_size
+            .max(layout.size())
+            .next_power_of_two()
+            .max(PAGE_SIZE);
+            let heap_ptr = self.alloc_pages(expand_size / PAGE_SIZE, PAGE_SIZE)?;
+            debug!(
+                "expand heap memory: [{:#x}, {:#x})",
+                heap_ptr,
+                heap_ptr + expand_size
+            );
+            balloc.add_memory(heap_ptr, expand_size)?;
+        }
+    }
+}
+```
+
+**TLSF (Two-Level Segregated Fit)**
+
+两级 bitmap + List 管理空闲块
+
+bitmap第一级：每一位对应一个范围的内存块，示例中分别对应$2^4$ ~ $2^{31}$。1表示空闲。
+
+bitmap第二级：有几位就表示几等分。例如， $2^6$ 表示64\~127，然后进行4等分就是64~79, 80~95, 96~107, 108~127，每一位对应一个范围，1表示空闲。
+
+然后就能找到包含对应范围大小的空闲块链表List。链表耗尽或者新建时，对应维护两级bitmap。
+
+**Buddy**
+
+分配单元：一般不会采用1字节，通常8，16，32…字节
+
+分配：寻找匹配需要(order)的最小块。如果order大于目标，则二分切割，直至相等，每级剩余的部分挂到对应的 Order List
+
+释放：查看是否有邻居空闲块，有则尽可能向高Oder合并，直至无法合并，挂到 Order List。
+
+**Slab**
+
+结构：
+
+1) 通过OrderList维护一系列Slab
+2) Slab维持一个空闲的block链表
+
+分配：从block空闲链表中弹出一个block。依靠 Buddy Allocator提供内存分配支持，初始时以及block不足时，从Buddy Allocator申请，分割block后加入block空闲链表。
+
+释放：放回block空闲链表。
+
+## Unikernel 地址空间与分页、多任务支持(协作式)
+
+### ReadPFlash
+
+PFlash的作用？Qemu 的 PFlash **模拟闪存磁盘**，启动时自动从文件加载内容到固定的 MMIO 区域，而且对读操作不需要驱动，可以直接访问。
+
+为何不指定"paging"时导致读PFlash失败？ArceOS Unikernel包括**两阶段地址空间映射**，Boot阶段默认开启1G空间的恒等映射；如果需要支持设备MMIO区间，通过指定一个feature - "paging"来实现重映射。
+
+分页启用的两个阶段：早期启用(必须)和后期重建映射(可选) 。
+
+阶段1：内核启动的早期，采用规定的恒等映射方式。但是只映射一部分物理空间。
+
+**目标**：完成Paging切换后，建立从虚拟空间`0xffff_ffc0_8000_0000` ~ `0xffff_ffc0_c000_0000`到物理空间`0x8000_0000`~`0xc000_0000` 的映射，范围 1G。
+
+两步完成Paging切换：
+
+1.恒等映射保证虚拟空间与物理空间有一个相等范围的地址空间映射(`0x8000_0000`~`0xc000_0000`)。切换前后地址范围不变，但地址空间已经从物理空间切换到虚拟空间。
+
+2.给指令指针寄存器`pc`，栈寄存器`sp`等加偏移，在图中该偏移是`0xffff_ffc0_0000_0000`。如此在虚拟空间执行平移后，就完成到最终目标地址的映射。
+
+```rust
+#[link_section = ".data.boot_page_table"]
+static mut BOOT_PT_SV39: [u64; 512] = [0; 512]; // 使用的是LDS定义布局时，直接预留的一页，所以不用额外内存分配
+
+unsafe fn init_boot_page_table() {
+    // 0x8000_0000..0xc000_0000, VRWX_GAD, 1G block
+    BOOT_PT_SV39[2] = (0x80000 << 10) | 0xef;
+    // 0xffff_ffc0_8000_0000..0xffff_ffc0_c000_0000, VRWX_GAD, 1G block
+    BOOT_PT_SV39[0x102] = (0x80000 << 10) | 0xef;
+}
+
+unsafe fn init_mmu() {
+    let page_table_root = BOOT_PT_SV39.as_ptr() as usize;
+    satp::set(satp::Mode::Sv39, 0, page_table_root >> 12);
+    riscv::asm::sfence_vma_all();
+}	
+```
+
+初始化根页表`BOOT_PT_SV39`，只有一级，即**每个页表项直接映射到 1G 的地址空间**。1G = $2^{30}$ 因此页表项 ID `pgd_idx == (VA >> 30) & (512 - 1)`
+
+`0x8000_0000 >> 30 == 2`，即页表第 2 项指向`0x8000_0000`~`0xc000_0000`
+
+`(0xffff_ffc0_8000_0000 >> 30) & (512 - 1) == 102`，即页表第 102 项指向`0xffff_ffc0_8000_0000`~`0xffff_ffc0_c000_0000`
+
+物理页帧号 == 物理地址 `0x8000_0000 >> 12 == 0x80000`
+
+指定paging feature的情况下，启动后期重建完整的空间映射。paging不是决定分页是否启用，而是决定是否包含阶段2。
+
+内存管理框架与功能：
+
+1) 内存分配功能
+
+内含两类分配器，**字节分配器**和**页分配器**。框架与算法分离，松耦合支持多种内存分配算法。
+
+2) 分页功能
+
+启动早期基于静态恒等映射完成分页切换，如果指定paging feature则会在启动后期重新建立范围更大，权限控制更细的映射。
+
+### ChildTask
+
+```rust
+pub struct TaskInner {
+    id: TaskId,
+    name: String,
+    is_idle: bool, // 是否为系统任务idle
+    is_init: bool, // 是否为主线程
+
+    entry: Option<*mut dyn FnOnce()>, // 实现任务逻辑函数的入口
+    state: AtomicU8, // 任务状态
+
+    in_wait_queue: AtomicBool,
+    #[cfg(feature = "irq")]
+    in_timer_list: AtomicBool,
+
+    #[cfg(feature = "preempt")]
+    need_resched: AtomicBool,
+    #[cfg(feature = "preempt")]
+    preempt_disable_count: AtomicUsize,
+
+    exit_code: AtomicI32,
+    wait_for_exit: WaitQueue,
+
+    kstack: Option<TaskStack>, // 栈空间
+    ctx: UnsafeCell<TaskContext>, // 上下文
+    task_ext: AxTaskExt, // 任务的扩展属性，对于Unikernel为空
+
+    #[cfg(feature = "tls")]
+    tls: TlsArea,
+}
+```
+
+接口公开的是runqueue的对应方法
+
+`spawn`&`spawn_raw`：产生一个新任务，加入runqueue，处于Ready
+
+`yield_now` (协作式调度的关键)：主动让出CPU执行权
+
+`sleep`&`sleep_until`：睡眠固定的时间后醒来，在timers定时器列表中注册，等待唤醒
+
+`exit`：当前任务退出，标记状态，等待GC回收
+
+```rust
+pub fn init_scheduler() {
+    info!("Initialize scheduling...");
+    crate::run_queue::init(); // 任务调度框架的核心
+    #[cfg(feature = "irq")]
+    crate::timers::init(); // 负责维护定时器列表，支持sleep等API的实现
+    info!("  use {} scheduler.", Scheduler::scheduler_name());
+}
+
+pub(crate) fn init() {
+    // Create the `idle` task (not current task).
+    const IDLE_TASK_STACK_SIZE: usize = 4096;
+    let idle_task = TaskInner::new(|| crate::run_idle(), "idle".into(), IDLE_TASK_STACK_SIZE);
+    IDLE_TASK.with_current(|i| {
+        i.init_once(idle_task.into_arc());
+    });
+    // Put the subsequent execution into the `main` task.
+    let main_task = TaskInner::new_init("main".into()).into_arc();
+    main_task.set_state(TaskState::Running);
+    unsafe { CurrentTask::init_current(main_task) };
+    RUN_QUEUE.init_once(AxRunQueue::new());
+}
+```
+
+### MsgQueue
+
+上下文Context包含寄存器:
+
+1)`ra`: 函数返回地址寄存器，这个切换实现了任务执行指令流的切换。
+
+2)`sp`: 任务即线程，这个是线程栈
+
+3)`s0`~`s11`：按照riscv规范，callee不能改这组寄存器的信息，所以需要保存。
+
+自旋锁：
+
+对于单CPU，加锁时只需要**关中断** + **关抢占**。无须额外的临界区互斥操作。
+
+对于SMP，才需要**基于相互可见的内存变量**进行原子互斥操作。
+
+互斥锁：
+
+通常可以认为是：**等待队列**waitq + **自旋锁**spinlock。
+
+等待队列是针对某种资源，任务之间进行协调。至多只能有一个任务持有资源，多于一个的任务进入睡眠状态，转入等待队列；直至被唤醒。
+
+## Unikernel 任务调度-抢占式、块设备与文件系统
+
+### FairSched
+
+抢占式调度：调度器依据策略，可以打断当前任务的执行，移交CPU执行权给当前“更”有资格 的任务。抢占机制的根本保障是系统定时器。所以抢占针对的主要操作目标就是current task当前任务。
+
+机制与时机：**不是无条件**的抢占，要两个条件都具备
+
+- 一是任务内部达到了某种条件，例如时间片耗尽；
+
+- 二是外部条件与时机，在preempt从disable到enable的那个状态切换点触发抢占。
+
+1. 只有内外条件都满足时，才发生抢占；内部条件举例任务时间片耗尽，外部条件类似定义某种临界区，控制什么时候不能抢占，本质上它基于当前任务的`preempt_disable_count`。
+2. 只在 禁用->启用 切换的下边沿触发；下边沿通常在自旋锁解锁时产生，此时是切换时机。
+3. 推动内部条件变化(例: 任务时间片消耗)和边沿触发产生(例: 自旋锁加解锁)的根本源是时钟中断。
+
+抢占针对的目标就是当前任务，由外部控制的抢占开关是当前任务的`preempt_disable_count`。作为计数：**0代表开抢占，大于0则关抢占**(可叠加，所以可能大于1)
+
+时钟中断与抢占式调度
+
+```rust
+#[cfg(feature = "irq")]
+fn init_interrupt() {
+    use axhal::time::TIMER_IRQ_NUM;
+
+    // Setup timer interrupt handler
+    const PERIODIC_INTERVAL_NANOS: u64 =
+        axhal::time::NANOS_PER_SEC / axconfig::TICKS_PER_SEC as u64;
+
+    #[percpu::def_percpu]
+    static NEXT_DEADLINE: u64 = 0;
+
+    fn update_timer() {
+        let now_ns = axhal::time::monotonic_time_nanos();
+        // Safety: we have disabled preemption in IRQ handler.
+        let mut deadline = unsafe { NEXT_DEADLINE.read_current_raw() };
+        if now_ns >= deadline {
+            deadline = now_ns + PERIODIC_INTERVAL_NANOS;
+        }
+        unsafe { NEXT_DEADLINE.write_current_raw(deadline + PERIODIC_INTERVAL_NANOS) };
+        axhal::time::set_oneshot_timer(deadline);
+    }
+	// 通过axhal 注册时钟中断，定期触发 axtask::on_timer_tick
+    axhal::irq::register_handler(TIMER_IRQ_NUM, || {
+        update_timer();
+        #[cfg(feature = "multitask")]
+        axtask::on_timer_tick();
+    });
+
+    // Enable IRQs before starting app
+    axhal::arch::enable_irqs();
+}
+
+#[cfg(feature = "irq")]
+#[doc(cfg(feature = "irq"))]
+pub fn on_timer_tick() {
+    crate::timers::check_events();
+    RUN_QUEUE.lock().scheduler_timer_tick();
+}
+
+#[cfg(feature = "irq")]
+pub fn scheduler_timer_tick(&mut self) {
+    let curr = crate::current();
+    // 触发特定调度器的task_tick，决定是否标记抢占标志，并可能进一步的导致任务队列的重排
+    if !curr.is_idle() && self.scheduler.task_tick(curr.as_task_ref()) {
+        #[cfg(feature = "preempt")]
+        curr.set_preempt_pending(true);
+    }
+}
+```
+
+### ReadBlock
+
+**AllDevices**管理系统所有的设备，为上层的子系统如文件系统FS、网络协议栈NET提供访问服务。三种设备类型：
+
+- 网络设备
+- 块设备
+- 图形设备
+
+设备发现与初始化过程
+
+- 主干组件`axruntime`在启动后期，发现设备并用相应驱动进行初始化
+- `axdriver`负责发现设备和对其初始化的过程，核心结构`AllDevices`
+- `probe`基于总线发现设备，逐个匹配驱动并初始化
+- 按照平台，有两种总线：
+  1) PCI总线：基于PCI总线协议发现和管理设备，对应PC & Server
+  2) MMIO总线：通常基于FDT解析发现和管理设备(目前未实现)
+
+目前管理设备和驱动数量少，采用简单方式，两级循环探测发现设备：
+
+第一级：遍历所有`virtio_mmio`地址范围，由平台物理内存布局决定并进行过分页映射
+
+第二级：用`for_each_drivers`宏枚举设备，然后对每个virtio设备`probe_mmio`进行探查
+
+virtio设备的probe过程
+
+1) qemu模拟器基于命令行产生设备
+
+```shell
+-device virtio-blk-device,drive=disk0
+-drive id=disk0,format=raw,file=disk**.**img
+```
+
+2) qemu将设备mmio地址区域映射到Guest中
+
+qemu-virt平台默认有8个区域槽位，通常只有部分会形成映射，其它处于未映射状态，即表现为空设备
+
+3) virtio-mmio驱动逐个发请求区探查3这些区域槽位
+
+对应映射设备响应请求，返回本设备的类型ID；
+
+没有映射的槽位返回零，表示空设备。
+
+4) virtio-mmio驱动把probe结果报告上层
+
+### LoadApp
+
+mount可以理解为文件系统在内存中的展开操作（unflatten），把易于存储的扁平化的形态转化为易于搜索遍历的立体化形态。
+
+把一棵目录树的“根” "嫁接"到另一棵树的某个结点，两棵树就形成了一棵树。两棵目录树基于的文件系统可以相同也可以不同。
+
+被mount的结点及其子孙结点都会被遮蔽，直至unmount。lookup操作到达mount点时，将会发生访问目录树的切换。
+
+## 从 Unikernel 到宏内核
+
+### UserPrivilege
+
+如何以 Unikernel 为基础，构建最小化宏内核？
+
+1. 能够创建和管理内核**地址空间**，为用户地址空间保留低端内存区域
+
+2. 可以从基于块设备的**文件系统**中搜索和读入应用程序文件
+
+3. 能够创建**子线程**任务，与主线程并发运行单独的逻辑代码
+
+4. 能够响应**异常和中断**
+
+从 Unikernel 基础到目标最小化宏内核需要完成的增量工作：
+
+1. 用户地址空间的创建和区域映射
+2. 在异常中断响应的基础上增加系统调用
+3. 复用 Unikernel 原来的调度机制，针对宏内核扩展 Task 属性
+4. 在内核与用户两个特权级之间的切换机制
+
+示例`m_1_0`的执行逻辑：
+
+1. 创建用户地址空间
+2. 加载应用origin到地址空间
+3. 在地址空间中建立用户栈
+4. 伪造一个返回应用的环境上下文现场
+5. 把伪造现场设置到到新任务的内核栈上
+6. 启动新任务执行`sret`指令返回到用户态，从应用origin的entry开始执行
+7. 应用origin只包含一行代码，即执行系统调用`sys_exit`
+8. 注册在异常中断向量表中的系统调用响应函数处理`sys_exit`，内核退出
+
+宏内核模式为用户应用建立了两类上下文，用户应用进程在它们之间交替运行：
+
+1. **任务上下文** - 用户态：正常执行应用逻辑，也称为进程上下文
+2. **异常上下文** - 内核态：处理系统调用与异常
+
+```rust
+fn main() {
+    // 为应用创建独立的用户地址空间
+    let mut uspace = axmm::new_user_aspace().unwrap();
+    // 加载应用程序代码到地址空间
+    if let Err(e) = load_user_app("/sbin/origin", &mut uspace) {
+        panic!("Cannot load app! {:?}", e);
+    }
+    // 初始化用户栈
+    let ustack_top = init_user_stack(&mut uspace, true).unwrap();
+    ax_println!("New user address space: {:#x?}", uspace);
+    // 创建用户任务
+    let user_task = task::spawn_user_task(
+        Arc::new(Mutex::new(uspace)),
+        UspaceContext::new(APP_ENTRY.into(), ustack_top),
+    );
+    // 让出CPU，使得用户任务运行
+    let exit_code = user_task.join();
+    ax_println!("monolithic kernel exit [{:?}] normally!", exit_code);
+}
+```
+
+页表分为高低两个部分：**高**端作为**内核**空间，**低端**作为**用户**应用空间。
+
+以初始的**内核根页表**为模板，为**每个应用进程复制独立页表**。**内核空间共享，用户空间独立使用**。
+
+用户应用构建方式：Rust工具链 + Rust嵌入式汇编
+
+示例：payload/origin
+
+```rust
+#[no_mangle]
+unsafe extern "C" fn _start() -> ! {
+    core::arch::asm!(
+        "addi sp, sp, -4",
+        "sw a0, (sp)",
+        "li a7, 93", // 93是 Sys_exit编号
+        "ecall", // 通过ecall触发系统调用
+        options(noreturn)
+    )
+}
+```
+
+首先编译`origin`生成ELF格式，然后被工具链转化为二进程BIN格式。
+
+```shell
+cargo build -p origin --target riscv64gc-unknown-none-elf --release
+rust-objcopy --binary-architecture=riscv64 --strip-all -O binary [origin_elf] [origin_bin]
+```
+
+`BIN`格式作为`exercises/m_1_0`使用的用户应用image。
+
+通过命令行`make disk_img`已经创建磁盘设备`disk.img`，并建立文件系统(fat32)。安装用户应用就是mount该磁盘设备文件到 `./mnt`目录，然后更新应用程序image。例如，安装应用`origin`的二进制Image：
+
+```shell
+mkdir -p ./mnt
+mount $(1) ./mnt
+mkdir -p ./mnt/sbin
+cp /tmp/origin.bin ./mnt/sbin
+umount ./mnt
+```
+
+把应用加载到用户地址空间
+
+第一步，从文件加载代码到内存缓冲区。
+
+第二步，为用户地址空间代码区域建立映射，拷贝代码到被映射页面中。
+
+对于各类内核模式，调度子系统机制是基本一致的，调度仅关心 Task 中与调度相关的属性，不关心资源属性。模式之间区别主要就在于资源属性不同。Unikernel 模式下，资源都是全局的，**Task 几乎不包含资源属性**；宏内核模式下，以进程为单位管理和隔离资源，**Task 表示进程时，其中就要包含属于自己的资源引用**。
+
+任务属性扩展机制的目的：尽可能复用共性的调度子系统，又能兼容处理各种模式的个性部分 - 资源管理。
+
+对于 RiscV 等多数体系结构来说，并**不存在一个专门指令实现从内核态到用户态的切换**。
+
+解决方法：在内核态伪造一个异常上下文现场，假装来自用户态，然后用`sret`指令返回去。
+
+## 宏内核地址空间映射和 Linux 应用支持
+
+### UserAspace
+
+地址空间管理涉及的主要对象：`AddrSpace`，`MemorySet`，`MemoryArea`和`Backend`的两种实现。
+
+`AddrSpace`：包含一系列有序的区域并对应一个页表。
+
+`MemorySet`：对`BTreeMap`的简单封装，对空间下的各个`MemoryArea`进行有序管理。
+
+`MemoryArea`：对应一个连续的虚拟地址内存区域，关联一个负责具体映射操作的后端`Backend`。
+
+`Backend`：负责具体的映射操作，不同的区域`MemoryArea`可以对应不同的`Backend`。目前支持两种后端类型：`Linear`和`Alloc`。
+
+对地址空间的主要操作就是查找目标区域或者是查找区域之间的空隙，因此对它们的有序管理是保证性能的关键。
+
+后端负责针对空间中特定区域的具体的映射操作，`Backend`从实现角度是一个Trait。
+
+`Linear`的应用场景：**目标物理地址空间区域已经存在，直接建立映射关系**。可以用于设备MMIO区域映射以及特殊的共享地址区域映射等。**对应的物理页帧必须连续**。
+
+`Alloc`的应用场景：**仅建立空映射，当真正被访问时将会触发缺页异常**，然后在缺页响应函数内部完成物理页帧的申请和补齐映射。也就是 **Lazy** 方式。按页映射，**对应的物理页帧通常情况下不连续**。
+
+### LinuxApp
+
+如何让Linux的原始应用（二进制）直接在我们的宏内核上直接运行？
+
+在应用和内核交互界面上实现兼容。兼容界面包含三类：
+
+1. syscall
+2. procfs & sysfs等伪文件系统
+3. 应用、编译器和libc对地址空间的假定，涉及某些参数定义或某些特殊地址的引用
+
+Linux 常用的文件系统包括 ProcFS、SysFS 和 DevFS，与普通文件系统不同，它们属于**伪文件系统**，具有相同的接口和抽象，但是 Backend 却不是普通的数据。
+
+Procfs 用于提供**内核和进程**信息的接口。它通常挂载在 `/proc` 目录下，包含了大量关于系统和进程的信息。
+
+Sysfs 用于向用户空间暴露**设备**信息。它通常挂载在 `/sys` 目录下。该文件系统主要用于**替代传统的 devfs**。
+
+Devfs 用于向用户空间暴露**设备和驱动**信息。目前主要是为了**兼容性**而存在。
+
+## 组件化内核的异构拓展实现
+
+### 快速构建异构内核的设想
+
+总结共性：Unikernel 基座
+
+区分特性：
+
+- 宏内核：进程、地址空间等
+- 虚拟机管理程序：模拟 CPU 状态、虚拟机抽象与接口管理
+- 微内核：IPC 机制实现
+
+构建共通基座，利用组件化获取定制性
+
+### 组件化异构内核的实践：ArceOS
+
+基础架构：Unikernel
+
+提供各类组件
+
+- 内核无关组件：buddy、pagetable
+- 内核相关组件：任务调度、驱动接口适配
+
+提供对外接口，运行上层应用（称为内核应用）
+
+- 区别于用户态应用
+- 内核应用仍然运行在内核态
+
+如何接入异构发展：对内核应用进行扩展
+
+### ArceOS 接入异构内核
+
+Backbone：Unikernel 本体
+
+宏内核扩展：starry-next
+
+- 地址空间管理
+- 以进程为单位管理、隔离资源
+- 引入 syscall 支持
+
+Hypervisor：arceos-umhv
+
+- Guest OS 调度与地址空间等管理
+- 设备虚拟化（中断、串口等）
+- VM exit 接口支持
+
+### ArceOS 接入异构内核细节：Backbone 兼容
+
+什么内容需要放在 Backbone？
+
+- 与 Backbone 功能相关，如调度、trap
+- 放在上层会导致模块关系混乱或打破依赖
+- 可为其他架构所或其他内核所复用
+- 实例：地址空间管理 axmm 模块
+
+异构内核的核心：不同架构的资源管理兼容
+
+- 如何做到兼容、可扩展、高性能兼顾？
+
+### ArceOS 接入异构内核细节：task 扩展
+
+内核资源的核心：任务单元设计
+
+- 可以将任务视为内核资源的集合
+- Unikernel：单个任务运行的必要信息，如上下文
+- 宏内核：页表信息、文件描述符等
+- Hypervisor：vcpu 状态等
+
+如何实现异构任务的扩展，达到如下要求：
+
+- 扩展性：尽可能减少对 backbone 的修改，易于复用
+- 高性能：不应当为了兼容而让性能有较高损耗
+
+方案一：在 task 中直接添加字段 
+
+- 利用 feature 添加字段
+- 用编译选项控制启动哪个架构
+- **不会有性能影响**（编译期决定）
+- **不利于可读性和异构扩展性**
+
+方案二：利用**索引**指向完整扩展实现
+
+- 仍然保留 Task 的机制
+- 将扩展内容额外实现在新的结构中
+- 两者通过某一个共通字段关联
+- - 常用 TaskID 进行联系
+- - 由于 Rust 限制，关联方式可选用 BTreeMap 等形式
+- 保留了一定的**可扩展性**
+- 但在查询索引的过程会带来**性能开销**
+
+方案三：简化版 TLS 机制 —— 引入 extension 扩展机制
+
+- 为 Task 引入一个 extension 域
+- 当外部实现了扩展内容，可初始化 extension 域
+- 使用**指针**进行调用，和传统结构体的访存开销近似
+- 在**保证扩展性**的同时**不影响性能开销**
+
+宏内核的扩展
+
+- 预先定义好扩展对象
+- 调用相关宏来初始化扩展域
+- 之后便可像正常域使用
+
+实现原理
+
+- 编译期确定扩展域大小
+- 在堆上申请内存
+- 将扩展域指针指向该内存
+- 对外提供相关的引用接口
+
+优势
+
+- 较低性能开销
+- 自由扩展性（自由定义 extension）
+
+### ArceOS 接入异构内核：系统服务复用
+
+Unikernel 已经提供的系统服务，如何方便被其他架构复用？
+
+挑战：资源隔离与共享
+
+已有资源举例
+
+- Fd_table
+- Virtual memory management
+- API handler
+
+资源的隔离与共享
+
+- Unikernel：全局唯一
+- 宏内核：进程拥有资源，通过 clone 控制共享
+
+一个复用的目标：api/arceos_posix_api
+
+原目标：为 Unikernel 提供对 POSIX 接口的适配
+
+异构化场景需求：宏内核 SYSCALL 层
+
+- POSIX 接口语义检查细节繁多，容易出现问题
+- 为了宏内核额外实现一个 syscall 层冗余且耗费精力
+- 异构资源归属不同，但**语义检查可以复用**
+- 通过配置，控制资源为 global 或者 per-process 资源
+
+引入新数据结构
+
+Resource
+
+- 定义“资源”
+- 利用 Arc 指针进行管理，可以在不同任务共享
+
+NameSpace
+
+- 保存所有的 Resource
+- Unikernel：全局唯一
+- 宏内核：类比控制块，每个任务一份，动态分配
+
+Namespace 要求
+
+- Unikernel：全局唯一
+- 宏内核：
+- - 支持独有或共享
+- - 共享时不应当产生额外开销
+
+实现方式
+
+- 通过 `link_section` 确定 Resource 地址
+- 编译期确定 global namespace 布局
+- - 所有 resource 集中在 `axns_resource` 段
+- - 构成了 global namespace
+- 对于每一个独有的 namespace
+- - 在堆上分配一段空间
+- - 将 global namespace 拷贝过去
+- 对每一个共享的 namespace
+- - 利用 `Arc` 指针进行共享
+
+Namespace 总结
+
+- 资源控制块的拆分
+- 支持方便地定义新资源，并通过配置修改其属性
+- 联动组件化的思想，让新功能更易接入
+- 复用已有的 POSIX 接口实现并且进一步扩展，降低工作量
+
+## 虚拟化原理和最简 Hypervisor
+
+## Hypervisor 地址空间管理基础
+
+## 虚拟机时钟中断和虚拟设备
