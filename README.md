@@ -1,3 +1,5 @@
+[starry-next 宏内核扩展实践记录](https://docs.qq.com/doc/DZHVReE11a1FCZFl4)
+
 # 2024 秋冬季开源操作系统训练营学习记录
 
 # rCore
